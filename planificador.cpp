@@ -7,6 +7,7 @@
 #include <unistd.h>  // Aquí vive la syscall fork()
 #include <sys/wait.h>// Aquí vive la syscall waitpid()
 #include <random>    // Para generar tiempos aleatorios si faltan
+#include <cstring>   
 
 using namespace std;
 enum Estado { PENDIENTE, EN_EJECUCION, TERMINADO };
@@ -21,6 +22,7 @@ struct Actividad {
     Estado estado = PENDIENTE; 
     int depencias_pendientes = 0; // Contador de dependencias que aún no se han completado
     pid_t pid = -1; // PID del proceso hijo que ejecuta esta actividad
+    int pipe_fd[2]; // Descriptor de archivos para el pipe
 };
 
 int main(int argc, char* argv[]) {
@@ -140,70 +142,82 @@ int main(int argc, char* argv[]) {
 
     cout << "\n--- INICIANDO SIMULACIÓN DIE CIOCHERA ---" << endl;
 
-    // Bucle principal: se repite hasta que todas las tareas estén TERMINADAS
+   // Bucle principal: se repite hasta que todas las tareas estén TERMINADAS
     while (tareas_terminadas < total_tareas) {
         
-        // 2. Lanzar nuevas tareas si tenemos espacio (procesos_activos < limite_K)
+        // Lanzar nuevas tareas si tenemos espacio
         for (auto& act : lista_actividades) {
-            if (procesos_activos >= limite_K) break; // No podemos superar K
+            if (procesos_activos >= limite_K) break; 
 
-            // Si la tarea no ha empezado y ya no debe esperar a nadie
             if (act.estado == PENDIENTE && act.dependencias_pendientes == 0) {
                 
-                pid_t pid = fork(); // ¡Creamos el proceso!
+                // NUEVO: Crear la tubería (pipe) ANTES del fork
+                if (pipe(act.pipe_fd) == -1) {
+                    cerr << "Error al crear el pipe para " << act.nombre << endl;
+                    return 1;
+                }
+
+                pid_t pid = fork(); 
 
                 if (pid == 0) {
                     // ---- CÓDIGO DEL PROCESO HIJO ----
-                    cout << "[HIJO] Iniciando: " << act.nombre << " (PID: " << getpid() << ") - Duración: " << act.tiempo_ms << "ms" << endl;
+                    close(act.pipe_fd[0]); // El hijo no va a leer, cerramos ese extremo
+
+                    cout << "[HIJO] Iniciando: " << act.nombre << " (PID: " << getpid() << ")" << endl;
+                    usleep(act.tiempo_ms * 1000); // Simulamos el trabajo
                     
-                    // Simular el tiempo de la actividad (usleep usa microsegundos, multiplicamos por 1000)
-                    usleep(act.tiempo_ms * 1000);
+                    // NUEVO: El hijo escribe el mensaje en el pipe antes de terminar
+                    string mensaje = "¡Insumo de " + act.nombre + " listo!";
+                    write(act.pipe_fd[1], mensaje.c_str(), mensaje.length() + 1);
+                    close(act.pipe_fd[1]); // Cerramos escritura
                     
-                    cout << "[HIJO] Finalizando: " << act.nombre << " (PID: " << getpid() << ")" << endl;
-                    exit(0); // El hijo muere aquí con éxito
+                    exit(0); 
                 } 
                 else if (pid > 0) {
                     // ---- CÓDIGO DEL PROCESO PADRE ----
-                    act.pid = pid;          // Guardamos el ID del hijo
-                    act.estado = EN_EJECUCION; // Marcamos que ya está corriendo
-                    procesos_activos++;     // Aumentamos el contador de procesos vivos
-                } 
-                else {
-                    cerr << "Error crítico al crear el proceso fork()" << endl;
-                    return 1;
+                    act.pid = pid;          
+                    act.estado = EJECUTANDO; 
+                    procesos_activos++;     
+                    close(act.pipe_fd[1]); // NUEVO: El padre no va a escribir, cierra ese extremo
                 }
             }
         }
 
-        // 3. Esperar a que algún proceso hijo termine (para no hacer busy-waiting)
+        // Esperar a que algún proceso hijo termine
         if (procesos_activos > 0) {
             int status;
-            pid_t pid_terminado = wait(&status); // El padre se pausa aquí hasta que un hijo haga exit(0)
+            pid_t pid_terminado = wait(&status); 
 
             if (pid_terminado > 0) {
                 procesos_activos--;
                 tareas_terminadas++;
 
-                // 4. Buscar qué actividad acaba de terminar en nuestra lista
-                string id_terminado = "";
+                // Buscar qué actividad terminó
                 for (auto& act : lista_actividades) {
                     if (act.pid == pid_terminado) {
                         act.estado = TERMINADO;
-                        id_terminado = act.id;
-                        break;
-                    }
-                }
+                        
+                        // NUEVO: El padre lee el mensaje que dejó el hijo en el pipe
+                        char buffer[256];
+                        read(act.pipe_fd[0], buffer, sizeof(buffer));
+                        close(act.pipe_fd[0]); // Cerramos lectura
 
-                // 5. Avisar a las demás tareas que esta ya terminó (restar 1 a sus pendientes)
-                for (auto& act : lista_actividades) {
-                    if (act.estado == PENDIENTE) {
-                        // Buscar si la que acaba de terminar era requerida por esta actividad
-                        for (const string& dep : act.dependencias) {
-                            if (dep == id_terminado) {
-                                act.dependencias_pendientes--;
-                                break;
+                        cout << "[MENSAJE PIPE] " << buffer << endl;
+
+                        // Avisar a las demás tareas y propagar el mensaje
+                        for (auto& dep_act : lista_actividades) {
+                            if (dep_act.estado == PENDIENTE) {
+                                for (const string& dep : dep_act.dependencias) {
+                                    if (dep == act.id) {
+                                        dep_act.dependencias_pendientes--;
+                                        cout << " -> Propagando a: " << dep_act.nombre 
+                                             << " (Faltan " << dep_act.dependencias_pendientes << " dependencias)" << endl;
+                                        break;
+                                    }
+                                }
                             }
                         }
+                        break;
                     }
                 }
             }
